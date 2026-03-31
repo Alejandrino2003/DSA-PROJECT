@@ -1,0 +1,1004 @@
+import hashlib
+import json
+import re
+import tkinter as tk
+from datetime import datetime, timedelta
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk
+import tkcalendar as tkc
+
+# ─── File / folder constants ──────────────────────────────────────────────────
+USERS_FILENAME    = "scheduler_users.txt"
+DATA_FOLDER       = "scheduler_data"
+SETTINGS_FILENAME = "scheduler_settings.json"
+
+# ─── Transparency key (must not appear anywhere in actual UI) ─────────────────
+TKEY = "#020304"
+
+# ─── Glass palette ────────────────────────────────────────────────────────────
+# Solid surfaces (header, buttons)
+CLR_HEADER   = "#1a73e8"
+CLR_DANGER   = "#e53935"
+CLR_SUCCESS  = "#2e9e4f"
+CLR_ACCENT   = "#f97316"
+
+# Panel bg — deep-navy "frosted glass" feel rendered over the background
+PANEL_BG     = "#0e1e3d"
+GLASS_BORDER = "#2e4a7a"
+
+# Text
+CLR_TEXT       = "#e8eeff"
+CLR_TEXT_MUTED = "#7a9cc8"
+CLR_TEXT_LABEL = "#a8c8f0"
+
+# Inputs
+CLR_INPUT_BG = "#0b1628"
+CLR_INPUT_BD = "#2a3f6a"
+
+# Badges
+CLR_EVT      = "#4db8ff"
+CLR_TODO     = "#ffd166"
+CLR_SELECTED = "#2563eb"
+
+QUOTES = [
+    "The secret of getting ahead is getting started. — Mark Twain",
+    "It always seems impossible until it's done. — Nelson Mandela",
+    "Focus on being productive instead of busy. — Tim Ferriss",
+    "Small steps every day lead to big results.",
+    "Plan your work and work your plan.",
+    "Done is better than perfect. — Sheryl Sandberg",
+]
+
+DEFAULT_CATEGORIES = [
+    {"id": 1, "name": "Work",     "color": "#1a73e8"},
+    {"id": 2, "name": "Personal", "color": "#34a853"},
+    {"id": 3, "name": "Health",   "color": "#ea4335"},
+    {"id": 4, "name": "Study",    "color": "#f9ab00"},
+    {"id": 5, "name": "Social",   "color": "#9c27b0"},
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class PersonalScheduler:
+# ══════════════════════════════════════════════════════════════════════════════
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("VIAM: Personal Scheduler")
+        self.root.geometry("1280x760")
+        self.root.minsize(960, 620)
+        self.root.configure(bg=TKEY)
+
+        self.folder        = Path(__file__).resolve().parent
+        self.users_file    = self.folder / USERS_FILENAME
+        self.data_dir      = self.folder / DATA_FOLDER
+        self.data_dir.mkdir(exist_ok=True)
+        self.settings_path = self.folder / SETTINGS_FILENAME
+
+        self.current_user   = None
+        self._selected_date = datetime.now().strftime("%Y-%m-%d")
+        self._clock_job     = None
+        self._quote_job     = None
+        self._quote_index   = 0
+        self.notebook       = None
+
+        # Background engine
+        self.bg_frames           = []
+        self.bg_frame_idx        = 0
+        self.bg_photo            = None
+        self._bg_win             = None
+        self._bg_lbl             = None
+        self._bg_anim_job        = None
+        self._bg_sync_job        = None
+        self._bg_resize_job      = None
+        self._bg_overlay_strength = 0.38
+        self._bg_cfg_bound       = False
+
+        self.setup_styles()
+        self._load_bg_image()
+        self._enable_bg_window()
+        self.show_login()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # BACKGROUND TOPLEVEL (sits behind the transparent main window)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _enable_bg_window(self):
+        try:
+            self.root.wm_attributes("-transparentcolor", TKEY)
+        except Exception:
+            pass
+        self._ensure_bg_win()
+        self.root.bind("<Configure>", self._schedule_bg_sync)
+        self._schedule_bg_sync()
+
+    def _ensure_bg_win(self):
+        if self._bg_win and self._bg_win.winfo_exists():
+            return
+        self._bg_win = tk.Toplevel(self.root)
+        self._bg_win.overrideredirect(True)
+        try:
+            self._bg_win.wm_attributes("-toolwindow", True)
+        except Exception:
+            pass
+        self._bg_win.lower(self.root)
+        self._bg_lbl = tk.Label(self._bg_win, bd=0, highlightthickness=0)
+        self._bg_lbl.pack(fill="both", expand=True)
+
+    def _schedule_bg_sync(self, _=None):
+        if self._bg_sync_job:
+            try: self.root.after_cancel(self._bg_sync_job)
+            except Exception: pass
+        self._bg_sync_job = self.root.after(60, self._sync_bg_win)
+
+    def _sync_bg_win(self):
+        self._bg_sync_job = None
+        if not (self._bg_win and self._bg_win.winfo_exists()):
+            return
+        try:
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            if w > 1 and h > 1:
+                self._bg_win.geometry(f"{w}x{h}+{x}+{y}")
+                self._bg_win.lower(self.root)
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # BACKGROUND IMAGE LOAD & ANIMATE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _load_bg_image(self):
+        settings = self._load_settings()
+        self._bg_overlay_strength = float(settings.get("background_overlay_strength", 0.38))
+        bg_name = (settings.get("background_file") or "").strip()
+
+        candidates = ([self.folder / bg_name] if bg_name else []) + \
+                     [self.folder / f"background{e}" for e in (".gif", ".png", ".jpg", ".jpeg")]
+
+        self.bg_frames = []
+        for p in candidates:
+            if not p.exists():
+                continue
+            try:
+                img = Image.open(p)
+                try:
+                    for i in range(img.n_frames):
+                        img.seek(i)
+                        self.bg_frames.append(img.copy())
+                except Exception:
+                    self.bg_frames = [img.copy()]
+                self.bg_frame_idx = 0
+                return
+            except Exception:
+                pass
+
+    def _start_bg(self):
+        if not self.bg_frames:
+            return
+        self._ensure_bg_win()
+        if not self._bg_cfg_bound:
+            self._bg_cfg_bound = True
+            self.root.bind("<Configure>", self._on_root_resize)
+        self._draw_bg()
+
+    def _on_root_resize(self, _=None):
+        self._schedule_bg_sync()
+        if self._bg_resize_job:
+            try: self.root.after_cancel(self._bg_resize_job)
+            except Exception: pass
+        self._bg_resize_job = self.root.after(100, self._draw_bg)
+
+    def _draw_bg(self):
+        if self._bg_anim_job:
+            try: self.root.after_cancel(self._bg_anim_job)
+            except Exception: pass
+            self._bg_anim_job = None
+
+        if not self.bg_frames or not (self._bg_lbl and self._bg_lbl.winfo_exists()):
+            return
+        try:
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if w < 2 or h < 2:
+                return
+
+            frame = self.bg_frames[self.bg_frame_idx]
+            fw, fh = frame.size
+            scale  = max(w / fw, h / fh)
+            nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+            scaled  = frame.resize((nw, nh), Image.Resampling.LANCZOS)
+            l, t   = max(0, (nw - w) // 2), max(0, (nh - h) // 2)
+            cropped = scaled.crop((l, t, l + w, t + h))
+
+            # Dark-navy tint overlay keeps the glass panels readable
+            overlay = Image.new("RGB", (w, h), "#08101e")
+            blended = Image.blend(cropped.convert("RGB"), overlay,
+                                  self._bg_overlay_strength)
+
+            self.bg_photo = ImageTk.PhotoImage(blended)
+            self._bg_lbl.config(image=self.bg_photo)
+            self._sync_bg_win()
+
+            if len(self.bg_frames) > 1:
+                self.bg_frame_idx = (self.bg_frame_idx + 1) % len(self.bg_frames)
+                self._bg_anim_job = self.root.after(110, self._draw_bg)
+        except Exception as e:
+            print(f"[BG] {e}")
+
+    def choose_background(self):
+        path = filedialog.askopenfilename(
+            title="Choose Background",
+            filetypes=[("Images", "*.gif *.png *.jpg *.jpeg")])
+        if not path:
+            return
+        src = Path(path)
+        if src.suffix.lower() not in {".gif", ".png", ".jpg", ".jpeg"}:
+            messagebox.showerror("Background", "Select a GIF, PNG, or JPG.")
+            return
+        dest = self.folder / f"background_custom{src.suffix.lower()}"
+        try:
+            dest.write_bytes(src.read_bytes())
+        except Exception:
+            messagebox.showerror("Background", "Could not copy file.")
+            return
+        s = self._load_settings()
+        s["background_file"] = dest.name
+        self._save_settings(s)
+        self._load_bg_image()
+        self._start_bg()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TTK STYLES
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def setup_styles(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        # TKEY bg on ttk containers keeps them transparent (main window shows through)
+        s.configure(".",               background=TKEY, foreground=CLR_TEXT)
+        s.configure("TFrame",          background=TKEY)
+        s.configure("TLabel",          background=TKEY, foreground=CLR_TEXT)
+        s.configure("TSeparator",      background=GLASS_BORDER)
+        s.configure("TNotebook",       background=TKEY, borderwidth=0, tabmargins=0)
+        s.configure("TNotebook.Tab",   padding=[18, 9], font=("Segoe UI", 10, "bold"),
+                    background="#0b1830", foreground=CLR_TEXT_MUTED, borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", CLR_HEADER), ("active", "#142040")],
+              foreground=[("selected", "white"),     ("active", CLR_TEXT)])
+        s.configure("Treeview",        rowheight=28, font=("Segoe UI", 10),
+                    background=CLR_INPUT_BG, foreground=CLR_TEXT,
+                    fieldbackground=CLR_INPUT_BG, borderwidth=0)
+        s.configure("Treeview.Heading",font=("Segoe UI", 10, "bold"),
+                    background="#0b1830", foreground=CLR_TEXT_LABEL)
+        s.map("Treeview",              background=[("selected", CLR_SELECTED)])
+        s.configure("TCombobox",       background=CLR_INPUT_BG, foreground=CLR_TEXT,
+                    fieldbackground=CLR_INPUT_BG, arrowcolor=CLR_TEXT_LABEL)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SETTINGS / DATA HELPERS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _load_settings(self):
+        if not self.settings_path.exists():
+            return {}
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_settings(self, data):
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _date_part(s):
+        s = (s or "").strip()
+        return s[:10] if len(s) >= 10 else s
+
+    @staticmethod
+    def hash_password(pw):
+        return hashlib.sha256(pw.encode()).hexdigest()
+
+    def load_users(self):
+        users = {}
+        if not self.users_file.exists():
+            return users
+        with open(self.users_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    users[rec["username"].strip().lower()] = rec
+                except Exception:
+                    pass
+        return users
+
+    def save_user(self, username, email, pw_hash):
+        rec = {"username": username.strip(), "email": email.strip(), "password_hash": pw_hash}
+        with open(self.users_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _user_path(self):
+        safe = "".join(c if c.isalnum() else "_" for c in self.current_user["username"].lower())
+        return self.data_dir / (safe + ".json")
+
+    def load_data(self):
+        path  = self._user_path()
+        blank = {"events": [], "tasks": [],
+                 "categories": list(DEFAULT_CATEGORIES), "daily_todos": {}}
+        if not path.exists():
+            return blank
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for k in blank:
+                d.setdefault(k, blank[k])
+            if not d["categories"]:
+                d["categories"] = list(DEFAULT_CATEGORIES)
+            return d
+        except Exception:
+            return blank
+
+    def save_data(self, data):
+        with open(self._user_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def next_id(items):
+        return max((i.get("id", 0) for i in items
+                    if isinstance(i.get("id"), int)), default=0) + 1
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # WINDOW HELPERS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def clear_window(self):
+        for job in (self._clock_job, self._quote_job):
+            if job:
+                try: self.root.after_cancel(job)
+                except Exception: pass
+        self._clock_job = self._quote_job = None
+        for w in self.root.winfo_children():
+            w.destroy()
+
+    # Widget factory helpers ───────────────────────────────────────────────────
+
+    def _entry(self, parent, **kw):
+        return tk.Entry(parent, font=("Segoe UI", 10),
+                        bg=CLR_INPUT_BG, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                        relief=tk.FLAT, highlightthickness=1,
+                        highlightbackground=CLR_INPUT_BD, **kw)
+
+    def _combo(self, parent, values, default=""):
+        w = ttk.Combobox(parent, values=values, state="readonly", font=("Segoe UI", 10))
+        if default:
+            w.set(default)
+        return w
+
+    def _btn(self, parent, text, command, bg, fg="white", **kw):
+        return tk.Button(parent, text=text, command=command,
+                         bg=bg, fg=fg, font=("Segoe UI", 10, "bold"),
+                         relief=tk.FLAT, cursor="hand2",
+                         activebackground=bg, activeforeground=fg, **kw)
+
+    def _form_row(self, parent, label, widget):
+        row = tk.Frame(parent, bg=PANEL_BG)
+        row.pack(fill="x", padx=20, pady=4)
+        tk.Label(row, text=label, width=24, anchor="w",
+                 font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=CLR_TEXT_LABEL).pack(side="left")
+        widget.pack(side="left", fill="x", expand=True)
+
+    def _panel_wrap(self, parent, title, color):
+        """Titled glass panel inside an Add-Items sub-tab."""
+        wrap = tk.Frame(parent, bg=PANEL_BG,
+                        highlightthickness=1, highlightbackground=GLASS_BORDER)
+        wrap.pack(fill="both", expand=True, padx=18, pady=14)
+        tk.Label(wrap, text=title, font=("Segoe UI", 13, "bold"),
+                 bg=PANEL_BG, fg=color).pack(anchor="w", padx=20, pady=(14, 4))
+        ttk.Separator(wrap).pack(fill="x", padx=20, pady=(0, 8))
+        return wrap
+
+    def _date_entry(self, parent):
+        var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        ent = self._entry(parent, textvariable=var, width=14)
+        return var, ent
+
+    def _text_row(self, parent, label, height=3):
+        row = tk.Frame(parent, bg=PANEL_BG)
+        row.pack(fill="x", padx=20, pady=4)
+        tk.Label(row, text=label, width=24, anchor="w",
+                 font=("Segoe UI", 9, "bold"),
+                 bg=PANEL_BG, fg=CLR_TEXT_LABEL).pack(side="left")
+        t = tk.Text(row, height=height, font=("Segoe UI", 10),
+                    bg=CLR_INPUT_BG, fg=CLR_TEXT, insertbackground=CLR_TEXT,
+                    relief=tk.FLAT, highlightthickness=1,
+                    highlightbackground=CLR_INPUT_BD)
+        t.pack(side="left", fill="x", expand=True)
+        return t
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LOGIN / REGISTER
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def show_login(self):
+        self.clear_window()
+        self._start_bg()
+
+        box = tk.Frame(self.root, bg=PANEL_BG,
+                       highlightthickness=1, highlightbackground=GLASS_BORDER)
+        box.place(relx=0.5, rely=0.5, anchor="center", width=420, height=350)
+
+        tk.Label(box, text="VIAM", font=("Segoe UI", 30, "bold"),
+                 bg=PANEL_BG, fg=CLR_HEADER).pack(pady=(26, 0))
+        tk.Label(box, text="Personal Scheduler", font=("Segoe UI", 10),
+                 bg=PANEL_BG, fg=CLR_TEXT_MUTED).pack(pady=(0, 6))
+        ttk.Separator(box).pack(fill="x", padx=24, pady=6)
+
+        def field(lbl, **kw):
+            tk.Label(box, text=lbl, bg=PANEL_BG,
+                     font=("Segoe UI", 9, "bold"), fg=CLR_TEXT_LABEL).pack(anchor="w", padx=28)
+            e = self._entry(box, width=32, **kw)
+            e.pack(pady=(2, 10), padx=28, ipady=5)
+            return e
+
+        u_e = field("Username")
+        p_e = field("Password", show="*")
+
+        bf = tk.Frame(box, bg=PANEL_BG)
+        bf.pack(pady=6)
+        self._btn(bf, "Login",    lambda: self.login(u_e.get(), p_e.get()),
+                  CLR_HEADER, padx=14, pady=5).pack(side="left", padx=5)
+        self._btn(bf, "Register", self.show_register,
+                  CLR_SUCCESS, padx=14, pady=5).pack(side="left", padx=5)
+        box.lift()
+
+    def show_register(self):
+        self.clear_window()
+        self._start_bg()
+
+        box = tk.Frame(self.root, bg=PANEL_BG,
+                       highlightthickness=1, highlightbackground=GLASS_BORDER)
+        box.place(relx=0.5, rely=0.5, anchor="center", width=430, height=450)
+
+        tk.Label(box, text="Create Account", font=("Segoe UI", 17, "bold"),
+                 bg=PANEL_BG, fg=CLR_HEADER).pack(pady=(22, 4))
+        ttk.Separator(box).pack(fill="x", padx=24, pady=6)
+
+        entries = {}
+        for lbl, kw in [("Username", {}), ("Email", {}),
+                        ("Password", {"show": "*"}),
+                        ("Confirm Password", {"show": "*"})]:
+            tk.Label(box, text=lbl, bg=PANEL_BG,
+                     font=("Segoe UI", 9, "bold"), fg=CLR_TEXT_LABEL).pack(anchor="w", padx=26)
+            e = self._entry(box, width=32, **kw)
+            e.pack(pady=(2, 9), padx=26, ipady=4)
+            entries[lbl] = e
+
+        self._btn(box, "Create Account",
+                  lambda: self.register(
+                      entries["Username"].get(), entries["Email"].get(),
+                      entries["Password"].get(), entries["Confirm Password"].get()),
+                  CLR_SUCCESS, padx=18, pady=6).pack(pady=8)
+        tk.Button(box, text="← Back to Login", command=self.show_login,
+                  bg=PANEL_BG, fg=CLR_EVT, relief=tk.FLAT,
+                  cursor="hand2", font=("Segoe UI", 9)).pack()
+        box.lift()
+
+    def login(self, username, password):
+        username = (username or "").strip()
+        if not username or not password:
+            messagebox.showerror("Login", "Please enter username and password.")
+            return
+        rec = self.load_users().get(username.lower())
+        if not rec or self.hash_password(password) != rec["password_hash"]:
+            messagebox.showerror("Login", "Wrong username or password.")
+            return
+        self.current_user = {"username": rec["username"]}
+        self.show_main()
+
+    def register(self, username, email, password, confirm):
+        username, email = (username or "").strip(), (email or "").strip()
+        if not username or not email or not password:
+            messagebox.showerror("Register", "Please fill in all fields.")
+            return
+        if password != confirm:
+            messagebox.showerror("Register", "Passwords do not match.")
+            return
+        if not re.match(r"^[^@]+@[^@]+\.[^@]+", email):
+            messagebox.showerror("Register", "Email is not valid.")
+            return
+        if username.lower() in self.load_users():
+            messagebox.showerror("Register", "Username already taken.")
+            return
+        self.save_user(username, email, self.hash_password(password))
+        messagebox.showinfo("Register", "Account created! You can log in now.")
+        self.show_login()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # MAIN INTERFACE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def show_main(self):
+        self.clear_window()
+        self._start_bg()
+
+        # Solid header — always visible regardless of background
+        top = tk.Frame(self.root, bg=CLR_HEADER, height=52)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+
+        tk.Label(top, text="VIAM", bg=CLR_HEADER, fg="white",
+                 font=("Segoe UI", 14, "bold")).pack(side="left", padx=(16, 4), pady=12)
+        tk.Label(top, text=f"•  {self.current_user['username']}", bg=CLR_HEADER,
+                 fg="#a8d4ff", font=("Segoe UI", 11)).pack(side="left")
+
+        self._clock_lbl = tk.Label(top, text="", bg=CLR_HEADER,
+                                   fg="#dce8ff", font=("Segoe UI", 10))
+        self._clock_lbl.pack(side="left", padx=18)
+        self._tick_clock()
+
+        self._btn(top, "⚙ Background", self.choose_background,
+                  "#2563eb", padx=9, pady=3).pack(side="right", padx=6)
+        self._btn(top, "Logout", self.logout,
+                  CLR_DANGER, padx=12, pady=3).pack(side="right", padx=10)
+
+        # TKEY shell so the notebook chrome is transparent
+        shell = tk.Frame(self.root, bg=TKEY)
+        shell.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.notebook = ttk.Notebook(shell)
+        self.notebook.pack(fill="both", expand=True, pady=(8, 0))
+
+        self.tab_dash = ttk.Frame(self.notebook)
+        self.tab_cal  = ttk.Frame(self.notebook)
+        self.tab_add  = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.tab_dash, text="  📊 Dashboard  ")
+        self.notebook.add(self.tab_cal,  text="  📅 Calendar   ")
+        self.notebook.add(self.tab_add,  text="  ➕ Add Items  ")
+
+        self._build_dashboard()
+        self._build_calendar()
+        self._build_add_items()
+
+    def _tick_clock(self):
+        try:
+            if not self._clock_lbl.winfo_exists():
+                return
+        except Exception:
+            return
+        self._clock_lbl.config(text=datetime.now().strftime("%a, %b %d  %I:%M:%S %p"))
+        self._clock_job = self.root.after(1000, self._tick_clock)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DASHBOARD
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_dashboard(self):
+        outer = tk.Frame(self.tab_dash, bg=TKEY)
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Stat cards
+        row = tk.Frame(outer, bg=TKEY)
+        row.pack(fill="x", pady=(0, 10))
+
+        self._stat_lbls  = {}
+        self._stat_cards = {}
+        for key, label, color in [
+            ("total_events",  "Total Events",      CLR_EVT),
+            ("upcoming",      "Upcoming (7 days)", CLR_HEADER),
+            ("overdue_tasks", "Overdue Tasks",      CLR_DANGER),
+            ("pending_todos", "Pending To-Dos",     CLR_TODO),
+            ("streak",        "Day Streak 🔥",      CLR_SUCCESS),
+        ]:
+            card = tk.Frame(row, bg=PANEL_BG, highlightthickness=1,
+                            highlightbackground=color, cursor="hand2")
+            card.pack(side="left", fill="both", expand=True, padx=5)
+            card.bind("<Button-1>", lambda e, k=key: self._card_click(k))
+            tk.Label(card, text=label, font=("Segoe UI", 8, "bold"),
+                     bg=PANEL_BG, fg=CLR_TEXT_MUTED).pack(pady=(12, 2))
+            v = tk.Label(card, text="—", font=("Segoe UI", 24, "bold"),
+                         bg=PANEL_BG, fg=color)
+            v.pack(pady=(0, 12))
+            v.bind("<Button-1>", lambda e, k=key: self._card_click(k))
+            self._stat_lbls[key]  = v
+            self._stat_cards[key] = card
+
+        # Overdue / Upcoming panels
+        mid = tk.Frame(outer, bg=TKEY)
+        mid.pack(fill="both", expand=True)
+
+        def info_panel(title, color):
+            f = tk.Frame(mid, bg=PANEL_BG, highlightthickness=1,
+                         highlightbackground=GLASS_BORDER)
+            f.pack(side="left", fill="both", expand=True, padx=5)
+            tk.Label(f, text=title, font=("Segoe UI", 11, "bold"),
+                     bg=PANEL_BG, fg=color).pack(anchor="w", padx=14, pady=(12, 4))
+            box = tk.Text(f, height=10, font=("Segoe UI", 9),
+                          bg=CLR_INPUT_BG, fg=CLR_TEXT, relief=tk.FLAT,
+                          state="disabled", wrap="word", padx=8, pady=4)
+            box.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+            return box
+
+        self._overdue_box  = info_panel("⚠️  Overdue / Due Today", CLR_DANGER)
+        self._upcoming_box = info_panel("📅  Next 7 Days",          CLR_HEADER)
+
+        # Quote + refresh
+        bot = tk.Frame(outer, bg=TKEY)
+        bot.pack(fill="x", pady=(10, 0))
+        self._quote_lbl = tk.Label(bot, text="", font=("Segoe UI", 9, "italic"),
+                                   bg=TKEY, fg=CLR_TEXT_MUTED, wraplength=820)
+        self._quote_lbl.pack(side="left", padx=4)
+        self._btn(bot, "↻  Refresh", self._refresh_dashboard,
+                  CLR_HEADER, padx=10, pady=3).pack(side="right", padx=4)
+
+        self._refresh_dashboard()
+        self._rotate_quote()
+
+    def _card_click(self, key):
+        for k, card in self._stat_cards.items():
+            clr = CLR_SELECTED if k == key else PANEL_BG
+            card.configure(bg=clr)
+            for ch in card.winfo_children():
+                if isinstance(ch, tk.Label):
+                    ch.configure(bg=clr)
+
+    def _refresh_dashboard(self):
+        data  = self.load_data()
+        today = datetime.now().date()
+        in7   = today + timedelta(days=7)
+
+        evs       = data["events"]
+        total_ev  = len(evs)
+        upcoming7 = sum(1 for e in evs if (s := e.get("start_time", ""))
+                        and today <= datetime.fromisoformat(s).date() <= in7)
+        overdue   = [t for t in data["tasks"] if t.get("status") != "Completed"
+                     and self._date_part(t.get("due_date", "")) < today.isoformat()]
+        due_today = [t for t in data["tasks"] if t.get("status") != "Completed"
+                     and self._date_part(t.get("due_date", "")) == today.isoformat()]
+        pending   = sum(sum(1 for x in v if not x.get("done"))
+                        for v in data["daily_todos"].values())
+        streak    = self._calc_streak(data)
+
+        for key, val in [("total_events", total_ev), ("upcoming", upcoming7),
+                         ("overdue_tasks", len(overdue)),
+                         ("pending_todos", pending), ("streak", streak)]:
+            self._stat_lbls[key].config(text=str(val))
+
+        def fill(box, lines, empty_msg):
+            box.config(state="normal")
+            box.delete("1.0", "end")
+            box.insert("end", "\n".join(lines) + "\n" if lines else f"  {empty_msg}\n")
+            box.config(state="disabled")
+
+        urgent = [
+            f"  {'⚠️' if f == 'o' else '⏰'} [TASK]  {t.get('title','')}  ({t.get('due_date','')[:10]})"
+            for t, f in [(t, "o") for t in overdue] + [(t, "t") for t in due_today]
+        ]
+        fill(self._overdue_box, urgent, "No overdue items. Great job! ✅")
+
+        ev_sorted = sorted(
+            [e for e in evs if (s := e.get("start_time", ""))
+             and today <= datetime.fromisoformat(s).date() <= in7],
+            key=lambda x: x["start_time"])[:12]
+        up_lines = []
+        for ev in ev_sorted:
+            try:
+                lbl = datetime.fromisoformat(ev["start_time"]).strftime("%a %b %d  %I:%M %p").lstrip("0")
+            except Exception:
+                lbl = ev.get("start_time", "?")[:10]
+            icon = {"High": "🔴", "Medium": "🟡"}.get(ev.get("priority", ""), "🟢")
+            up_lines.append(f"  {icon}  {lbl}  ·  {ev.get('title','')}")
+        fill(self._upcoming_box, up_lines, "No events in the next 7 days.")
+
+    def _calc_streak(self, data):
+        streak, day = 0, datetime.now().date()
+        for _ in range(365):
+            if any(t.get("done") for t in data["daily_todos"].get(day.isoformat(), [])):
+                streak += 1
+                day -= timedelta(days=1)
+            else:
+                break
+        return streak
+
+    def _rotate_quote(self):
+        try:
+            if not self._quote_lbl.winfo_exists():
+                return
+        except Exception:
+            return
+        self._quote_lbl.config(text=f'"{QUOTES[self._quote_index % len(QUOTES)]}"')
+        self._quote_index += 1
+        self._quote_job = self.root.after(8000, self._rotate_quote)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CALENDAR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_calendar(self):
+        outer = tk.Frame(self.tab_cal, bg=TKEY)
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Calendar card
+        cal_card = tk.Frame(outer, bg=PANEL_BG,
+                            highlightthickness=1, highlightbackground=GLASS_BORDER)
+        cal_card.pack(side="left", padx=10, pady=10)
+
+        self.calendar = tkc.Calendar(
+            cal_card, selectmode="day", date_pattern="yyyy-mm-dd",
+            font=("Segoe UI", 10),
+            background=PANEL_BG,        foreground=CLR_TEXT,
+            bordercolor=GLASS_BORDER,
+            headersbackground="#07101e", headersforeground="#90b8f0",
+            selectbackground=CLR_HEADER, selectforeground="white",
+            normalbackground=PANEL_BG,  normalforeground=CLR_TEXT,
+            weekendbackground="#0b1830", weekendforeground="#7a9cc8",
+            othermonthbackground="#081018", othermonthforeground="#2a3f60",
+            cursor="hand2")
+        self.calendar.pack(padx=10, pady=10)
+        self.calendar.bind("<<CalendarSelected>>", self._on_cal_select)
+        self.calendar.bind("<Double-1>",            self._on_cal_dblclick)
+
+        # Legend
+        legend = tk.Frame(cal_card, bg=PANEL_BG)
+        legend.pack(pady=(0, 12))
+        for dot, lbl in [("#4db8ff", " event"), ("#ffd166", " to-do"),
+                         ("#2e9e4f", " both"),  ("#c084fc", " today")]:
+            tk.Label(legend, text="●", fg=dot, bg=PANEL_BG,
+                     font=("Segoe UI", 11, "bold")).pack(side="left", padx=(6, 0))
+            tk.Label(legend, text=lbl, fg=CLR_TEXT_MUTED,
+                     bg=PANEL_BG, font=("Segoe UI", 8)).pack(side="left")
+
+        # Day events panel
+        right = tk.Frame(outer, bg=PANEL_BG,
+                         highlightthickness=1, highlightbackground=GLASS_BORDER)
+        right.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+        self._day_lbl = tk.Label(right, text="", font=("Segoe UI", 13, "bold"),
+                                 bg=PANEL_BG, fg=CLR_TEXT)
+        self._day_lbl.pack(anchor="w", padx=16, pady=(16, 2))
+        tk.Label(right, text="Events for selected date",
+                 font=("Segoe UI", 9), bg=PANEL_BG,
+                 fg=CLR_TEXT_MUTED).pack(anchor="w", padx=16)
+
+        ev_wrap = tk.Frame(right, bg=CLR_INPUT_BG,
+                           highlightthickness=1, highlightbackground=GLASS_BORDER)
+        ev_wrap.pack(fill="both", expand=True, padx=16, pady=(8, 16))
+
+        self._ev_list = tk.Listbox(ev_wrap, font=("Segoe UI", 10),
+                                   bg=CLR_INPUT_BG, fg=CLR_TEXT,
+                                   selectbackground=CLR_SELECTED,
+                                   highlightthickness=0, bd=0,
+                                   relief=tk.FLAT, activestyle="none")
+        self._ev_list.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self._on_cal_select()
+        self._refresh_cal_tags()
+
+    def _on_cal_select(self, _=None):
+        self._selected_date = self.calendar.get_date()
+        try:
+            d = datetime.strptime(self._selected_date, "%Y-%m-%d")
+            prefix = "Today — " if self._selected_date == datetime.now().strftime("%Y-%m-%d") else ""
+            self._day_lbl.config(text=f"{prefix}{d.strftime('%A, %B %d %Y')}")
+        except Exception:
+            self._day_lbl.config(text=self._selected_date)
+        self._load_day_events(self._selected_date)
+
+    def _on_cal_dblclick(self, _=None):
+        """Double-click: jump to Add Items tab, pre-fill date."""
+        self.notebook.select(self.tab_add)
+        try:
+            self._ai_date_var.set(self.calendar.get_date())
+        except Exception:
+            pass
+
+    def _refresh_cal_tags(self):
+        try:
+            data = self.load_data()
+            self.calendar.calevent_remove("all")
+            self.calendar.tag_config("ev",    background="#102050")
+            self.calendar.tag_config("td",    background="#2a1e00")
+            self.calendar.tag_config("both",  background="#0a2a18")
+            self.calendar.tag_config("today", background="#220d40")
+
+            ev_dates = {e["start_time"][:10] for e in data["events"]
+                        if len(e.get("start_time", "")) >= 10}
+            td_dates = {d for d, v in data["daily_todos"].items() if v}
+            today    = datetime.now().strftime("%Y-%m-%d")
+
+            for d in ev_dates | td_dates | {today}:
+                try:
+                    obj = datetime.strptime(d, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                tag = ("both"  if d in ev_dates and d in td_dates
+                       else "ev"    if d in ev_dates
+                       else "td"    if d in td_dates
+                       else "today")
+                self.calendar.calevent_create(obj, "", tag)
+        except Exception:
+            pass
+
+    def _load_day_events(self, date_str):
+        self._ev_list.delete(0, tk.END)
+        events = sorted([e for e in self.load_data()["events"]
+                         if e.get("start_time", "")[:10] == date_str],
+                        key=lambda x: x.get("start_time", ""))
+        if not events:
+            self._ev_list.insert(tk.END, "  (No events this day)")
+            return
+        for ev in events:
+            try:
+                st = datetime.fromisoformat(ev["start_time"])
+                en = datetime.fromisoformat(ev["end_time"])
+                line = (f"  {st.strftime('%I:%M %p').lstrip('0')} – "
+                        f"{en.strftime('%I:%M %p').lstrip('0')}  ·  {ev.get('title','')}")
+            except Exception:
+                line = f"  {ev.get('title','?')}"
+            if ev.get("location"):
+                line += f"  @ {ev['location']}"
+            line += {"High": "  🔴", "Medium": "  🟡",
+                     "Low": "  🟢"}.get(ev.get("priority", ""), "")
+            self._ev_list.insert(tk.END, line)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ADD ITEMS TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_add_items(self):
+        outer = tk.Frame(self.tab_add, bg=TKEY)
+        outer.pack(fill="both", expand=True, padx=14, pady=10)
+
+        hdr = tk.Frame(outer, bg=TKEY)
+        hdr.pack(fill="x", pady=(0, 8))
+        tk.Label(hdr, text="➕  Add New Items",
+                 font=("Segoe UI", 14, "bold"), bg=TKEY, fg=CLR_ACCENT).pack(side="left")
+        tk.Label(hdr, text="  —  events, tasks, or to-dos",
+                 font=("Segoe UI", 9), bg=TKEY, fg=CLR_TEXT_MUTED).pack(side="left")
+
+        sub = ttk.Notebook(outer)
+        sub.pack(fill="both", expand=True)
+
+        for title, builder in [("  📌 Event  ", self._form_event),
+                                ("  ✅ Task   ", self._form_task),
+                                ("  📝 To-Do  ", self._form_todo)]:
+            tab = ttk.Frame(sub)
+            sub.add(tab, text=title)
+            builder(tab)
+
+    # ── Event form ────────────────────────────────────────────────────────────
+    def _form_event(self, parent):
+        w   = self._panel_wrap(parent, "New Event", CLR_EVT)
+        ttl = self._entry(w);              self._form_row(w, "Title *",               ttl)
+        self._ai_date_var, de = self._date_entry(w)
+        self._form_row(w, "Date (YYYY-MM-DD) *", de)
+        st  = self._entry(w, width=14);    st.insert(0, "9:00 AM")
+        self._form_row(w, "Start Time *",  st)
+        en  = self._entry(w, width=14);    en.insert(0, "10:00 AM")
+        self._form_row(w, "End Time *",    en)
+        loc = self._entry(w);              self._form_row(w, "Location",              loc)
+        pri = self._combo(w, ["Low","Medium","High"], "Medium")
+        self._form_row(w, "Priority",      pri)
+        dsc = self._text_row(w, "Description")
+
+        def save():
+            title, ds = ttl.get().strip(), self._ai_date_var.get().strip()
+            if not title or not ds:
+                messagebox.showerror("Error", "Title and Date required."); return
+            try:
+                s_dt = datetime.strptime(f"{ds} {st.get().strip()}", "%Y-%m-%d %I:%M %p")
+                e_dt = datetime.strptime(f"{ds} {en.get().strip()}", "%Y-%m-%d %I:%M %p")
+            except Exception:
+                messagebox.showerror("Error", "Time format: 9:00 AM"); return
+            if e_dt <= s_dt:
+                messagebox.showerror("Error", "End must be after start."); return
+            data = self.load_data()
+            data["events"].append({
+                "id": self.next_id(data["events"]), "title": title,
+                "description": dsc.get("1.0","end").strip(),
+                "start_time": s_dt.isoformat(), "end_time": e_dt.isoformat(),
+                "location": loc.get().strip(), "priority": pri.get()})
+            self.save_data(data)
+            self._refresh_cal_tags(); self._refresh_dashboard()
+            for f in (ttl, loc): f.delete(0, "end")
+            dsc.delete("1.0", "end")
+            messagebox.showinfo("Saved", "✅ Event added!")
+
+        self._btn(w, "  Save Event  ", save, CLR_EVT,
+                  padx=14, pady=6).pack(anchor="e", padx=20, pady=14)
+
+    # ── Task form ─────────────────────────────────────────────────────────────
+    def _form_task(self, parent):
+        w   = self._panel_wrap(parent, "New Task", CLR_SUCCESS)
+        ttl = self._entry(w);              self._form_row(w, "Title *",                ttl)
+        dv, de = self._date_entry(w);      self._form_row(w, "Due Date (YYYY-MM-DD) *", de)
+        tm  = self._entry(w, width=14);    tm.insert(0, "5:00 PM")
+        self._form_row(w, "Time Goal",     tm)
+        pri = self._combo(w, ["Low","Medium","High"], "Medium")
+        self._form_row(w, "Priority",      pri)
+        sts = self._combo(w, ["Pending","In Progress","Completed"], "Pending")
+        self._form_row(w, "Status",        sts)
+        dsc = self._text_row(w, "Description")
+
+        def save():
+            title, ds = ttl.get().strip(), dv.get().strip()
+            if not title or not ds:
+                messagebox.showerror("Error", "Title and Due Date required."); return
+            try:
+                due = datetime.strptime(f"{ds} {tm.get().strip()}", "%Y-%m-%d %I:%M %p")
+            except Exception:
+                messagebox.showerror("Error", "Time format: 5:00 PM"); return
+            data = self.load_data()
+            data["tasks"].append({
+                "id": self.next_id(data["tasks"]), "title": title,
+                "description": dsc.get("1.0","end").strip(),
+                "due_date": due.isoformat(), "priority": pri.get(), "status": sts.get()})
+            self.save_data(data); self._refresh_dashboard()
+            ttl.delete(0, "end"); dsc.delete("1.0", "end")
+            messagebox.showinfo("Saved", "✅ Task added!")
+
+        self._btn(w, "  Save Task  ", save, CLR_SUCCESS,
+                  padx=14, pady=6).pack(anchor="e", padx=20, pady=14)
+
+    # ── To-Do form ────────────────────────────────────────────────────────────
+    def _form_todo(self, parent):
+        w   = self._panel_wrap(parent, "New To-Do", CLR_TODO)
+        ttl = self._entry(w);              self._form_row(w, "Title *",             ttl)
+        dv, de = self._date_entry(w);      self._form_row(w, "Date (YYYY-MM-DD) *", de)
+        pri = self._combo(w, ["Low","Medium","High"], "Low")
+        self._form_row(w, "Priority",      pri)
+        ntxt = self._text_row(w, "Notes", height=4)
+
+        done_var = tk.BooleanVar()
+        drow = tk.Frame(w, bg=PANEL_BG)
+        drow.pack(fill="x", padx=20, pady=4)
+        tk.Checkbutton(drow, text="Mark as Done", variable=done_var,
+                       bg=PANEL_BG, fg=CLR_TEXT, selectcolor=CLR_INPUT_BG,
+                       activebackground=PANEL_BG, font=("Segoe UI", 9)).pack(side="left")
+
+        def save():
+            title, ds = ttl.get().strip(), dv.get().strip()
+            if not title or not ds:
+                messagebox.showerror("Error", "Title and Date required."); return
+            try:
+                datetime.strptime(ds, "%Y-%m-%d")
+            except Exception:
+                messagebox.showerror("Error", "Date must be YYYY-MM-DD"); return
+            data  = self.load_data()
+            todos = data["daily_todos"].setdefault(ds, [])
+            todos.append({"id": self.next_id(todos), "title": title,
+                          "notes": ntxt.get("1.0","end").strip(),
+                          "priority": pri.get(), "done": done_var.get()})
+            self.save_data(data)
+            self._refresh_cal_tags(); self._refresh_dashboard()
+            ttl.delete(0, "end"); ntxt.delete("1.0", "end"); done_var.set(False)
+            messagebox.showinfo("Saved", "✅ To-Do added!")
+
+        self._btn(w, "  Save To-Do  ", save, "#a37400", fg="white",
+                  padx=14, pady=6).pack(anchor="e", padx=20, pady=14)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LOGOUT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def logout(self):
+        self.current_user = None
+        self.show_login()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = PersonalScheduler(root)
+    root.mainloop()
